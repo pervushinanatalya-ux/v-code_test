@@ -5,16 +5,19 @@ The module is UI-agnostic and focuses solely on state updates and rules:
     * vacuuming balls into the inventory with the mouse,
     * spitting balls back onto the field,
     * color mixing whenever balls touch (no physical repulsion),
-    * optional delete zone that removes balls crossing it.
+    * optional delete zone that removes balls crossing it,
+    * a capture strip along the bottom for stored balls,
+    * automatic refilling so the playfield never runs dry.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 import colorsys
 import math
 import itertools
+import random
 
 Color = Tuple[float, float, float]  # RGB, normalized [0.0, 1.0]
 
@@ -48,6 +51,7 @@ class Ball:
     velocity: Vec2
     radius: float
     color: Color
+    stored_velocity: Vec2 = field(default_factory=lambda: Vec2(0.0, 0.0))
 
 
 @dataclass
@@ -86,13 +90,25 @@ class DeleteZone:
 
 
 class GameLogic:
-    """Encapsulates state updates and interactions for the ball playground."""
+    """Encapsulates simulation, capture strip layout, and auto-refill logic."""
 
     def __init__(
         self,
         width: float,
         height: float,
         delete_zone: Optional[DeleteZone] = None,
+        *,
+        inventory_strip_height: float = 100.0,
+        inventory_slot_size: float = 48.0,
+        inventory_padding: float = 16.0,
+        refill_on_remove: bool = True,
+        refill_generator: Optional[
+            Callable[
+                ["GameLogic"],
+                Tuple[Tuple[float, float], Tuple[float, float], float, Color],
+            ]
+        ] = None,
+        rng_seed: Optional[int] = None,
     ) -> None:
         self.width = width
         self.height = height
@@ -100,6 +116,12 @@ class GameLogic:
         self.inventory = Inventory()
         self._balls: List[Ball] = []
         self._id_counter = itertools.count()
+        self.inventory_strip_height = max(0.0, inventory_strip_height)
+        self.inventory_slot_size = max(1.0, inventory_slot_size)
+        self.inventory_padding = max(0.0, inventory_padding)
+        self.refill_on_remove = refill_on_remove
+        self._refill_generator = refill_generator
+        self._rng = random.Random(rng_seed)
 
     # --------------------------------------------------------------------- #
     # Public API
@@ -119,6 +141,7 @@ class GameLogic:
             radius=radius,
             color=color,
         )
+        ball.stored_velocity = ball.velocity
         self._balls.append(ball)
         return ball
 
@@ -128,6 +151,7 @@ class GameLogic:
             self._move_ball(ball, dt)
             if self.delete_zone and self.delete_zone.contains(ball.position):
                 self._balls.remove(ball)
+                self._spawn_replacement()
 
         self._apply_color_mixing()
 
@@ -138,21 +162,35 @@ class GameLogic:
             return None
 
         self._balls.remove(target)
+        target.stored_velocity = target.velocity
         self.inventory.add(target)
+        self._refresh_inventory_layout()
+        self._spawn_replacement()
         return target
 
     def spit_ball(
         self,
         position: Tuple[float, float],
-        velocity: Tuple[float, float],
+        velocity: Optional[Tuple[float, float]] = None,
     ) -> Optional[Ball]:
         """Eject the most recently stored ball back onto the playfield."""
         ball = self.inventory.pop_last()
         if not ball:
             return None
 
+        self._refresh_inventory_layout()
+        chosen_velocity = (
+            Vec2(*velocity)
+            if velocity is not None
+            else (
+                ball.stored_velocity
+                if ball.stored_velocity.length() > 0.0
+                else self._random_velocity()
+            )
+        )
         ball.position = Vec2(*position)
-        ball.velocity = Vec2(*velocity)
+        ball.velocity = chosen_velocity
+        ball.stored_velocity = chosen_velocity
         self._balls.append(ball)
         return ball
 
@@ -165,11 +203,12 @@ class GameLogic:
     # --------------------------------------------------------------------- #
     def _move_ball(self, ball: Ball, dt: float) -> None:
         ball.position = ball.position + ball.velocity * dt
+        ball.stored_velocity = ball.velocity
 
         # Wrap-around edges keep gameplay dense without extra rules.
         ball.position = Vec2(
             ball.position.x % self.width,
-            ball.position.y % self.height,
+            ball.position.y % self._play_area_height(),
         )
 
     def _apply_color_mixing(self) -> None:
@@ -207,6 +246,76 @@ class GameLogic:
 
         candidates.sort(key=lambda item: item[1])
         return candidates[0][0]
+
+    def _refresh_inventory_layout(self) -> None:
+        if self.inventory_strip_height <= 0:
+            return
+
+        for idx, ball in enumerate(self.inventory):
+            self._place_ball_in_inventory(ball, idx)
+
+    def _place_ball_in_inventory(self, ball: Ball, slot_index: int) -> None:
+        slot_position = self._inventory_slot_position(slot_index)
+        ball.position = slot_position
+        ball.velocity = Vec2(0.0, 0.0)
+
+    def _inventory_slot_position(self, slot_index: int) -> Vec2:
+        safe_width = max(1.0, self.width)
+        usable_width = max(1.0, safe_width - 2 * min(self.inventory_padding, safe_width / 2))
+        columns = max(1, int(usable_width // self.inventory_slot_size))
+        slot_width = usable_width / columns
+        gutter_offset = (safe_width - usable_width) / 2
+
+        col = slot_index % columns
+        row = slot_index // columns
+
+        x = gutter_offset + slot_width * (col + 0.5)
+        slot_height = min(self.inventory_slot_size, max(1.0, self.inventory_strip_height))
+        strip_top = max(0.0, self.height - self.inventory_strip_height)
+        max_offset = max(0.0, self.inventory_strip_height - slot_height / 2)
+        row_offset = slot_height * (row + 0.5)
+        y = strip_top + min(row_offset, max_offset if max_offset > 0 else slot_height / 2)
+        y = min(self.height - slot_height / 2, y)
+
+        clamped_x = min(safe_width - slot_width / 2, max(slot_width / 2, x))
+        return Vec2(clamped_x, y)
+
+    def _spawn_replacement(self) -> None:
+        if not self.refill_on_remove:
+            return
+
+        spawn_spec = (
+            self._refill_generator(self)
+            if self._refill_generator
+            else self._default_spawn_spec()
+        )
+
+        position, velocity, radius, color = spawn_spec
+        self.spawn_ball(position, velocity, radius, color)
+
+    def _random_velocity(self, speed_range: Tuple[float, float] = (40.0, 140.0)) -> Vec2:
+        angle = self._rng.uniform(0.0, 2 * math.pi)
+        speed = self._rng.uniform(*speed_range)
+        return Vec2(math.cos(angle) * speed, math.sin(angle) * speed)
+
+    def _default_spawn_spec(
+        self,
+    ) -> Tuple[Tuple[float, float], Tuple[float, float], float, Color]:
+        x = self._rng.uniform(0.0, max(1.0, self.width))
+        y = self._rng.uniform(0.0, self._play_area_height())
+        radius = self._rng.uniform(12.0, 26.0)
+        velocity_vec = self._random_velocity()
+        color = self._random_color()
+        return ((x, y), (velocity_vec.x, velocity_vec.y), radius, color)
+
+    def _random_color(self) -> Color:
+        hue = self._rng.random()
+        saturation = self._rng.uniform(0.65, 1.0)
+        value = self._rng.uniform(0.7, 1.0)
+        return colorsys.hsv_to_rgb(hue, saturation, value)
+
+    def _play_area_height(self) -> float:
+        return max(1.0, self.height - self.inventory_strip_height)
 
     @staticmethod
     def _mix_colors(color_a: Color, color_b: Color) -> Color:
